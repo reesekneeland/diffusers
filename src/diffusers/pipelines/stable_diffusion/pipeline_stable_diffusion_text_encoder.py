@@ -90,7 +90,7 @@ def preprocess(image):
     return image
 
 
-class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
+class StableDiffusionTextEncodingPipeline(DiffusionPipeline):
     r"""
     Pipeline for text-guided image to image generation using Stable Diffusion.
 
@@ -248,12 +248,10 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
                 return torch.device(module._hf_hook.execution_device)
         return self.device
 
-    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline._encode_prompt
-    def _encode_prompt(
+    def encode_prompt(
         self,
         prompt,
-        device,
-        num_images_per_prompt,
+        device,,
         do_classifier_free_guidance,
         negative_prompt=None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
@@ -386,6 +384,22 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
         print("PROMPT EMBEDS SHAPE 2: ", prompt_embeds.shape)
         return prompt_embeds
+    
+    def encode_latents(self, image, device="cuda", generator=None):
+        if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
+            raise ValueError(
+                f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
+            )
+
+        image = image.to(device=device)
+        init_latents = self.vae.encode(image).latent_dist.sample(generator)
+
+        init_latents = self.vae.config.scaling_factor * init_latents
+
+        # get latents
+        latents = init_latents
+
+        return latents
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.run_safety_checker
     def run_safety_checker(self, image, device, dtype):

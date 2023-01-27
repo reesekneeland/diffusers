@@ -41,6 +41,7 @@ if is_transformers_available() and is_torch_available():
     from .pipeline_cycle_diffusion import CycleDiffusionPipeline
     from .pipeline_stable_diffusion import StableDiffusionPipeline
     from .pipeline_stable_diffusion_img2img import StableDiffusionImg2ImgPipeline
+    from .pipeline_stable_diffusion_text_encoder import StableDiffusionTextEncodingPipeline
     from .pipeline_stable_diffusion_inpaint import StableDiffusionInpaintPipeline
     from .pipeline_stable_diffusion_inpaint_legacy import StableDiffusionInpaintPipelineLegacy
     from .pipeline_stable_diffusion_instruct_pix2pix import StableDiffusionInstructPix2PixPipeline
@@ -54,6 +55,7 @@ except OptionalDependencyNotAvailable:
     from ...utils.dummy_torch_and_transformers_objects import StableDiffusionImageVariationPipeline
 else:
     from .pipeline_stable_diffusion_image_variation import StableDiffusionImageVariationPipeline
+    from .pipeline_stable_diffusion_image_encoding import StableDiffusionImageEncodingPipeline
 
 
 try:
