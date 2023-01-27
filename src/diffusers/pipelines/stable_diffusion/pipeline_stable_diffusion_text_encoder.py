@@ -251,7 +251,7 @@ class StableDiffusionTextEncodingPipeline(DiffusionPipeline):
     def encode_prompt(
         self,
         prompt,
-        device,,
+        device,
         do_classifier_free_guidance,
         negative_prompt=None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
