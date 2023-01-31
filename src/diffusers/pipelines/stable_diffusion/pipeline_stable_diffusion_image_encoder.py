@@ -4,8 +4,8 @@ import inspect
 from typing import Callable, List, Optional, Union
 
 import torch
-import sys, os
-os.environ['CUDA_VISIBLE_DEVICES'] = "2,3"
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "3"
 
 import torch
 
@@ -149,7 +149,20 @@ class StableDiffusionImageEncodingPipeline(DiffusionPipeline):
                 return torch.device(module._hf_hook.execution_device)
         return self.device
 
-    def _encode_image(self, image, device="cuda", num_images_per_prompt=1, do_classifier_free_guidance=True):
+    def encode_image(self, image, device="cuda", num_images_per_prompt=1, do_classifier_free_guidance=True):
+        tform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize(
+                (224, 224),
+                interpolation=transforms.InterpolationMode.BICUBIC,
+                antialias=False,
+                ),
+            transforms.Normalize(
+            [0.48145466, 0.4578275, 0.40821073],
+            [0.26862954, 0.26130258, 0.27577711]),
+        ])
+        image = tform(image).to(device).unsqueeze(0)
+        
         dtype = next(self.image_encoder.parameters()).dtype
 
         if not isinstance(image, torch.Tensor):
@@ -171,7 +184,6 @@ class StableDiffusionImageEncodingPipeline(DiffusionPipeline):
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
             image_embeddings = torch.cat([negative_prompt_embeds, image_embeddings])
-
         return image_embeddings
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.decode_latents
@@ -224,7 +236,7 @@ class StableDiffusionImageEncodingPipeline(DiffusionPipeline):
             )
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_latents
-    def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+    def prepare_latents(self, timestep, batch_size, num_channels_latents, height, width, dtype, device, generator=None, latents=None):
         shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
@@ -233,18 +245,33 @@ class StableDiffusionImageEncodingPipeline(DiffusionPipeline):
             )
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            latents = randn_tensor(shape, dtype=dtype, device=device)
         else:
             latents = latents.to(device)
 
         # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
-        return latents
+        shape = latents.shape
+        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        # get latents
+        init_latents = self.scheduler.add_noise(latents, noise, timestep)
+        
+        return init_latents
+    
+    def get_timesteps(self, num_inference_steps, strength, device):
+        # get the original timestep using init_timestep
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+
+        t_start = max(num_inference_steps - init_timestep, 0)
+        timesteps = self.scheduler.timesteps[t_start:]
+
+        return timesteps, num_inference_steps - t_start
 
     @torch.no_grad()
     def __call__(
         self,
-        image: Union[PIL.Image.Image, List[PIL.Image.Image], torch.FloatTensor],
+        image: Optional[Union[PIL.Image.Image, List[PIL.Image.Image], torch.FloatTensor]],
+        z: Optional[torch.FloatTensor] = None,
+        c: Optional[torch.FloatTensor] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
@@ -333,7 +360,7 @@ class StableDiffusionImageEncodingPipeline(DiffusionPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Encode input image
-        image_embeddings = self._encode_image(image, device, num_images_per_prompt, do_classifier_free_guidance)
+        image_embeddings = self.encode_image(image, device, num_images_per_prompt, do_classifier_free_guidance)
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -356,14 +383,15 @@ class StableDiffusionImageEncodingPipeline(DiffusionPipeline):
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         # 7. Denoising loop
+        timesteps = timesteps.to(device)
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
                 # predict the noise residual
+                print("image embedding shape before noise pred in call", image_embeddings.shape)
                 noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=image_embeddings).sample
 
                 # perform guidance
@@ -382,15 +410,97 @@ class StableDiffusionImageEncodingPipeline(DiffusionPipeline):
 
         # 8. Post-processing
         image = self.decode_latents(latents)
-
-        # 9. Run safety checker
-        image, has_nsfw_concept = self.run_safety_checker(image, device, image_embeddings.dtype)
-
         # 10. Convert to PIL
         if output_type == "pil":
             image = self.numpy_to_pil(image)
+        return image[0]
 
-        if not return_dict:
-            return (image, has_nsfw_concept)
+    @torch.no_grad()
+    def encode(
+        self,
+        z: Optional[torch.FloatTensor] = None,
+        c: Optional[torch.FloatTensor] = None,
+        strength: Optional[float]=0.8,
+        guidance_scale: float = 7.5
+    ):
+        r"""
+        Function invoked when calling the pipeline for generation.
 
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        Args:
+            z (`torch.FloatTensor`, *optional*):
+                given latent vector to reconstruct
+            c (`torch.FloatTensor`, *optional*):
+                given 1x1x768 clip vector to reconstruct, must me made from IMAGE embedding
+            strength (`float`, *optional*, defaults to 0.8):
+                How much to weight the clip reconstruction vs the initial latent vector. 0.0 means only use the latent,
+                1.0 means only use the clip.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
+
+        Returns:
+            reconstructed PIL image
+        """
+        device = self._execution_device
+        num_inference_steps = int(strength * 50)
+        
+        if(strength==0.0):
+            image_np = self.decode_latents(z.to(torch.float32))
+            image_np = (image_np * 255).round().astype("uint8")
+            image = PIL.Image.fromarray(image_np.reshape((512, 512, 3)))
+            return image
+        
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+        latent_timestep = timesteps[:1].repeat(1)
+        
+        if(strength==1.0):
+            latents = self.prepare_latents(timestep=latent_timestep, batch_size=1, num_channels_latents=4, height=512, width=512, dtype=torch.float32, device=device)
+        else:
+            latents = z.to(torch.float32)
+            # get noisy latents
+            noise = randn_tensor(latents.shape, dtype=torch.float32, device=device)
+            latents = self.scheduler.add_noise(latents, noise, latent_timestep)
+        
+       
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # 3. Encode input image
+        image_embeddings = c.to(torch.float32)
+
+        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        extra_step_kwargs = self.prepare_extra_step_kwargs(None, 0.0)
+        # 7. Denoising loop
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                # predict the noise residual
+                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=image_embeddings).sample
+
+                # perform guidance
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+        # 8. Post-processing
+        image_np = self.decode_latents(latents)
+        # 10. Convert to PIL
+        image_np = (image_np * 255).round().astype("uint8")
+        
+        image = PIL.Image.fromarray(image_np.reshape((512, 512, 3)))
+        return image

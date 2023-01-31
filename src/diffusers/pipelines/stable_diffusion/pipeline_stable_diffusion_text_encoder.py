@@ -14,9 +14,11 @@
 
 import inspect
 from typing import Callable, List, Optional, Union
-
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "3"
 import numpy as np
 import torch
+from torchvision import transforms
 
 import PIL
 from packaging import version
@@ -209,6 +211,26 @@ class StableDiffusionTextEncodingPipeline(DiffusionPipeline):
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
 
+    def preprocess(self, image):
+        if isinstance(image, torch.Tensor):
+            return image
+        elif isinstance(image, PIL.Image.Image):
+            image = [image]
+
+        if isinstance(image[0], PIL.Image.Image):
+            w, h = image[0].size
+            w, h = map(lambda x: x - x % 8, (w, h))  # resize to integer multiple of 8
+
+            image = [np.array(i.resize((w, h), resample=PIL_INTERPOLATION["lanczos"]))[None, :] for i in image]
+            image = np.concatenate(image, axis=0)
+            image = np.array(image).astype(np.float32) / 255.0
+            image = image.transpose(0, 3, 1, 2)
+            image = 2.0 * image - 1.0
+            image = torch.from_numpy(image)
+        elif isinstance(image[0], torch.Tensor):
+            image = torch.cat(image, dim=0)
+        return image
+    
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.enable_sequential_cpu_offload
     def enable_sequential_cpu_offload(self, gpu_id=0):
         r"""
@@ -251,8 +273,8 @@ class StableDiffusionTextEncodingPipeline(DiffusionPipeline):
     def encode_prompt(
         self,
         prompt,
-        device,
-        do_classifier_free_guidance,
+        device="cuda",
+        do_classifier_free_guidance=True,
         negative_prompt=None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
@@ -325,8 +347,8 @@ class StableDiffusionTextEncodingPipeline(DiffusionPipeline):
 
         bs_embed, seq_len, _ = prompt_embeds.shape
         # duplicate text embeddings for each generation per prompt, using mps friendly method
-        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+        prompt_embeds = prompt_embeds.repeat(1, 1, 1)
+        prompt_embeds = prompt_embeds.view(bs_embed * 1, seq_len, -1)
         print("PROMPT EMBEDS SHAPE 1: ", prompt_embeds.shape)
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
@@ -375,32 +397,30 @@ class StableDiffusionTextEncodingPipeline(DiffusionPipeline):
 
             negative_prompt_embeds = negative_prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
 
-            negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
-            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+            negative_prompt_embeds = negative_prompt_embeds.repeat(1, 1, 1)
+            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * 1, seq_len, -1)
 
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
-        print("PROMPT EMBEDS SHAPE 2: ", prompt_embeds.shape)
+            # print("PROMPT EMBEDS SHAPE 2", prompt_embeds.shape)
+            # prompt_embeds = prompt_embeds[:, text_input_ids.argmax(dim=-1)] @ torch.empty(768, 768).to(device=device, dtype=torch.float16)
+            # print("PROMPT EMBEDS SHAPE 2", prompt_embeds.shape)
         return prompt_embeds
     
-    def encode_latents(self, image, device="cuda", generator=None):
-        if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
-            raise ValueError(
-                f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
-            )
 
-        image = image.to(device=device)
+    def encode_latents(self, image, dtype=torch.float16, device="cuda", generator=None):
+        image = self.preprocess(image)
+        # transform = transforms.Compose([transforms.ToTensor()])
+        # im_tensor = transform(image).half().to(device)
+        image = image.to(device=device, dtype=dtype)
         init_latents = self.vae.encode(image).latent_dist.sample(generator)
 
         init_latents = self.vae.config.scaling_factor * init_latents
 
-        # get latents
-        latents = init_latents
-
-        return latents
-
+        return init_latents
+    
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.run_safety_checker
     def run_safety_checker(self, image, device, dtype):
         if self.safety_checker is not None:
@@ -491,57 +511,6 @@ class StableDiffusionTextEncodingPipeline(DiffusionPipeline):
 
         return timesteps, num_inference_steps - t_start
 
-    def prepare_latents(self, image, timestep, batch_size, num_images_per_prompt, dtype, device, generator=None):
-        if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
-            raise ValueError(
-                f"`image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(image)}"
-            )
-
-        image = image.to(device=device, dtype=dtype)
-
-        batch_size = batch_size * num_images_per_prompt
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-            )
-
-        if isinstance(generator, list):
-            init_latents = [
-                self.vae.encode(image[i : i + 1]).latent_dist.sample(generator[i]) for i in range(batch_size)
-            ]
-            init_latents = torch.cat(init_latents, dim=0)
-        else:
-            init_latents = self.vae.encode(image).latent_dist.sample(generator)
-
-        init_latents = self.vae.config.scaling_factor * init_latents
-
-        if batch_size > init_latents.shape[0] and batch_size % init_latents.shape[0] == 0:
-            # expand init_latents for batch_size
-            deprecation_message = (
-                f"You have passed {batch_size} text prompts (`prompt`), but only {init_latents.shape[0]} initial"
-                " images (`image`). Initial images are now duplicating to match the number of text prompts. Note"
-                " that this behavior is deprecated and will be removed in a version 1.0.0. Please make sure to update"
-                " your script to pass as many initial images as text prompts to suppress this warning."
-            )
-            deprecate("len(prompt) != len(image)", "1.0.0", deprecation_message, standard_warn=False)
-            additional_image_per_prompt = batch_size // init_latents.shape[0]
-            init_latents = torch.cat([init_latents] * additional_image_per_prompt, dim=0)
-        elif batch_size > init_latents.shape[0] and batch_size % init_latents.shape[0] != 0:
-            raise ValueError(
-                f"Cannot duplicate `image` of batch size {init_latents.shape[0]} to {batch_size} text prompts."
-            )
-        else:
-            init_latents = torch.cat([init_latents], dim=0)
-
-        shape = init_latents.shape
-        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-
-        # get latents
-        init_latents = self.scheduler.add_noise(init_latents, noise, timestep)
-        latents = init_latents
-
-        return latents
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
