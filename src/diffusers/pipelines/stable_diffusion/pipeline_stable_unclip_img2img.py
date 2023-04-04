@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import PIL
 import torch
+import numpy as np
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
 from diffusers.utils.import_utils import is_accelerate_available
@@ -25,7 +26,7 @@ from ...loaders import TextualInversionLoaderMixin
 from ...models import AutoencoderKL, UNet2DConditionModel
 from ...models.embeddings import get_timestep_embedding
 from ...schedulers import KarrasDiffusionSchedulers
-from ...utils import is_accelerate_version, logging, randn_tensor, replace_example_docstring
+from ...utils import is_accelerate_version, logging, randn_tensor, replace_example_docstring, PIL_INTERPOLATION
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 from .stable_unclip_image_normalizer import StableUnCLIPImageNormalizer
 
@@ -224,6 +225,68 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
             ):
                 return torch.device(module._hf_hook.execution_device)
         return self.device
+    
+    def preprocess(self, image):
+        if isinstance(image, torch.Tensor):
+            return image
+        elif isinstance(image, PIL.Image.Image):
+            image = [image]
+
+        if isinstance(image[0], PIL.Image.Image):
+            w, h = image[0].size
+            w, h = map(lambda x: x - x % 8, (w, h))  # resize to integer multiple of 8
+
+            image = [np.array(i.resize((w, h), resample=PIL_INTERPOLATION["lanczos"]))[None, :] for i in image]
+            image = np.concatenate(image, axis=0)
+            image = np.array(image).astype(np.float32) / 255.0
+            image = image.transpose(0, 3, 1, 2)
+            image = 2.0 * image - 1.0
+            image = torch.from_numpy(image)
+        elif isinstance(image[0], torch.Tensor):
+            image = torch.cat(image, dim=0)
+        return image
+    
+    def encode_prompt_raw(
+        self,
+        prompt,
+        device,
+    ):
+        # textual inversion: procecss multi-vector tokens if necessary
+        if isinstance(self, TextualInversionLoaderMixin):
+            prompt = self.maybe_convert_prompt(prompt, self.tokenizer)
+
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids
+        untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+            text_input_ids, untruncated_ids
+        ):
+            removed_text = self.tokenizer.batch_decode(
+                untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
+            )
+            logger.warning(
+                "The following part of your input was truncated because CLIP can only handle sequences up to"
+                f" {self.tokenizer.model_max_length} tokens: {removed_text}"
+            )
+
+        if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+            attention_mask = text_inputs.attention_mask.to(device)
+        else:
+            attention_mask = None
+
+        prompt_embeds = self.text_encoder(
+            text_input_ids.to(device),
+            attention_mask=attention_mask,
+        )
+        prompt_embeds = prompt_embeds[0]
+        return prompt_embeds
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline._encode_prompt
     def _encode_prompt(
@@ -372,6 +435,22 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
 
         return prompt_embeds
 
+    def encode_image_raw(
+        self,
+        image,
+        device,
+        batch_size=1,
+        num_images_per_prompt=1):
+        dtype = next(self.image_encoder.parameters()).dtype
+        image = image.resize((768, 768))
+
+        if not isinstance(image, torch.Tensor):
+            image = self.feature_extractor(images=image, return_tensors="pt").pixel_values
+
+        image = image.to(device=device, dtype=dtype)
+        image_embeds = self.image_encoder(image).image_embeds
+        return image_embeds
+
     def _encode_image(
         self,
         image,
@@ -403,7 +482,6 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
 
             image = image.to(device=device, dtype=dtype)
             image_embeds = self.image_encoder(image).image_embeds
-
         image_embeds = self.noise_image_embeddings(
             image_embeds=image_embeds,
             noise_level=noise_level,
@@ -416,7 +494,6 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
         image_embeds = image_embeds.repeat(1, repeat_by, 1)
         image_embeds = image_embeds.view(bs_embed * repeat_by, seq_len, -1)
         image_embeds = image_embeds.squeeze(1)
-
         if do_classifier_free_guidance:
             negative_prompt_embeds = torch.zeros_like(image_embeds)
 
@@ -424,7 +501,6 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
             image_embeds = torch.cat([negative_prompt_embeds, image_embeds])
-
         return image_embeds
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.decode_latents
@@ -516,10 +592,6 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
                 f"`noise_level` must be between 0 and {self.image_noising_scheduler.config.num_train_timesteps - 1}, inclusive."
             )
 
-        if image is not None and image_embeds is not None:
-            raise ValueError(
-                "Provide either `image` or `image_embeds`. Please make sure to define only one of the two."
-            )
 
         if image is None and image_embeds is None:
             raise ValueError(
@@ -538,7 +610,24 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
                 )
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_latents
-    def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+    # def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+    #     shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
+    #     if isinstance(generator, list) and len(generator) != batch_size:
+    #         raise ValueError(
+    #             f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+    #             f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+    #         )
+
+    #     if latents is None:
+    #         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+    #     else:
+    #         latents = latents.to(device)
+
+    #     # scale the initial noise by the standard deviation required by the scheduler
+    #     latents = latents * self.scheduler.init_noise_sigma
+    #     return latents
+
+    def prepare_latents(self, timestep, batch_size, num_channels_latents, height, width, dtype, device, generator=None, latents=None, image=None):
         shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
@@ -546,14 +635,32 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        else:
+        if latents is not None:
             latents = latents.to(device)
+        elif image is not None:
+            image = self.preprocess(image)
+            image = image.to(device=device, dtype=dtype)
+            init_latents = self.vae.encode(image).latent_dist.sample(generator)
 
+            latents = self.vae.config.scaling_factor * init_latents
+        else:
+            latents = randn_tensor(shape, dtype=dtype, device=device)
         # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
-        return latents
+        shape = latents.shape
+        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        # get latents
+        init_latents = self.scheduler.add_noise(latents, noise, timestep)
+        
+        return init_latents
+    
+    def get_timesteps(self, num_inference_steps, strength, device):
+        # get the original timestep using init_timestep
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+
+        t_start = max(num_inference_steps - init_timestep, 0)
+        timesteps = self.scheduler.timesteps[t_start:]
+
+        return timesteps, num_inference_steps - t_start
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_unclip.StableUnCLIPPipeline.noise_image_embeddings
     def noise_image_embeddings(
@@ -604,13 +711,14 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
-    def __call__(
+    def reconstruct(
         self,
         image: Union[torch.FloatTensor, PIL.Image.Image] = None,
         prompt: Union[str, List[str]] = None,
+        strength: float = 1.0,
         height: Optional[int] = None,
         width: Optional[int] = None,
-        num_inference_steps: int = 20,
+        num_inference_steps: int = 50,
         guidance_scale: float = 10,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
@@ -620,7 +728,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
-        return_dict: bool = True,
+        return_dict: bool = False,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -742,6 +850,14 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
+        num_channels_latents = self.unet.in_channels
+        # Set up latents
+        if(strength==0.0):
+            image_np = self.decode_latents(latents.to(torch.float32))
+            image_np = (image_np * 255).round().astype("uint8")
+            image = PIL.Image.fromarray(image_np.reshape((height, width, 3)))
+            return image
+        
 
         # 3. Encode input prompt
         prompt_embeds = self._encode_prompt(
@@ -756,6 +872,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
 
         # 4. Encoder input image
         noise_level = torch.tensor([noise_level], device=device)
+            
         image_embeds = self._encode_image(
             image=image,
             device=device,
@@ -767,22 +884,36 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
             image_embeds=image_embeds,
         )
 
-        # 5. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
-
-        # 6. Prepare latent variables
-        num_channels_latents = self.unet.in_channels
-        latents = self.prepare_latents(
-            batch_size=batch_size,
-            num_channels_latents=num_channels_latents,
-            height=height,
-            width=width,
-            dtype=prompt_embeds.dtype,
-            device=device,
-            generator=generator,
-            latents=latents,
-        )
+        timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+        latent_timestep = timesteps[:1].repeat(1)
+        
+        if(strength==1.0):
+            latents = self.prepare_latents(
+                                timestep=latent_timestep,
+                                batch_size=batch_size,
+                                num_channels_latents=num_channels_latents,
+                                height=height,
+                                width=width,
+                                dtype=prompt_embeds.dtype,
+                                device=device,
+                                generator=generator,
+                                latents=None,
+                                image=None,
+                                )
+        else:
+            latents = self.prepare_latents(
+                                timestep=latent_timestep,
+                                batch_size=batch_size,
+                                num_channels_latents=num_channels_latents,
+                                height=height,
+                                width=width,
+                                dtype=prompt_embeds.dtype,
+                                device=device,
+                                generator=generator,
+                                latents=latents,
+                                image=image,
+                                )
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -824,6 +955,6 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
             image = self.numpy_to_pil(image)
 
         if not return_dict:
-            return (image,)
+            return image[0]
 
         return ImagePipelineOutput(images=image)
