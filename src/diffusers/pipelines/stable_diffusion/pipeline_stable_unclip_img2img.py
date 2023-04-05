@@ -446,7 +446,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
 
         image = image.to(device=device, dtype=dtype)
         image_embeds = self.image_encoder(image).image_embeds
-        return image_embeds
+        return image_embeds.detach()
 
     def _encode_image(
         self,
