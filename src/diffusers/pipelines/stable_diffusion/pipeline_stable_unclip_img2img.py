@@ -249,7 +249,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
     def encode_prompt_raw(
         self,
         prompt,
-        device,
+        device="cuda",
     ):
         # textual inversion: procecss multi-vector tokens if necessary
         if isinstance(self, TextualInversionLoaderMixin):
@@ -366,8 +366,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
                 attention_mask=attention_mask,
             )
             prompt_embeds = prompt_embeds[0]
-
-        prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
+        prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=device).reshape((1,77,1024))
 
         bs_embed, seq_len, _ = prompt_embeds.shape
         # duplicate text embeddings for each generation per prompt, using mps friendly method
@@ -438,9 +437,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
     def encode_image_raw(
         self,
         image,
-        device,
-        batch_size=1,
-        num_images_per_prompt=1):
+        device="cuda"):
         dtype = next(self.image_encoder.parameters()).dtype
         image = image.resize((768, 768))
 
@@ -482,6 +479,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
 
             image = image.to(device=device, dtype=dtype)
             image_embeds = self.image_encoder(image).image_embeds
+        image_embeds = image_embeds.to(dtype=dtype, device=device).reshape((1,1024))
         image_embeds = self.noise_image_embeddings(
             image_embeds=image_embeds,
             noise_level=noise_level,
@@ -919,7 +917,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         # 8. Denoising loop
-        for i, t in enumerate(self.progress_bar(timesteps)):
+        for i, t in enumerate(timesteps):
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
