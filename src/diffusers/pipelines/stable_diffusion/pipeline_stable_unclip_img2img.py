@@ -436,16 +436,16 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
 
     def encode_image_raw(
         self,
-        image,
+        images,
         device="cuda"):
         dtype = next(self.image_encoder.parameters()).dtype
-        image = image.resize((768, 768))
 
-        if not isinstance(image, torch.Tensor):
-            image = self.feature_extractor(images=image, return_tensors="pt").pixel_values
+        # if not isinstance(images, torch.Tensor):
+        image = self.feature_extractor(images=images, return_tensors="pt").pixel_values
 
         image = image.to(device=device, dtype=dtype)
-        image_embeds = self.image_encoder(image).image_embeds
+        embeds = self.image_encoder(image)
+        image_embeds = embeds.image_embeds
         return image_embeds.detach()
 
     def _encode_image(
